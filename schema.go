@@ -2,12 +2,21 @@ package saml
 
 import (
 	"encoding/xml"
+	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/beevik/etree"
 	"github.com/russellhaering/goxmldsig/etreeutils"
 )
+
+type SAMLRequest interface {
+	getDestination() string
+	getID() string
+	Post(relayState string) (form []byte, reqID string)
+	Redirect(relayState string) *url.URL
+	Element() *etree.Element
+}
 
 // AuthnRequest represents the SAML object of the same name, a request from a service provider
 // to authenticate a user.
@@ -39,6 +48,38 @@ type AuthnRequest struct {
 	ProviderName                   string `xml:",attr"`
 }
 
+type LogoutRequest struct {
+	XMLName xml.Name `xml:"urn:oasis:names:tc:SAML:2.0:protocol LogoutRequest"`
+
+	ID              string    `xml:",attr"`
+	Version         string    `xml:",attr"`
+	IssueInstant    time.Time `xml:",attr"`
+	Reason          string    `xml:",attr"`
+	Destination     string    `xml:",attr"`
+	ProtocolBinding string    `xml:",attr"`
+
+	NameID       *NameID       `xml:"urn:oasis:names:tc:SAML:2.0:assertion NameID"`
+	SessionIndex *SessionIndex `xml:"urn:oasis:names:tc:SAML:2.0:assertion SessionIndex"`
+	Issuer       *Issuer       `xml:"urn:oasis:names:tc:SAML:2.0:assertion Issuer"`
+	Signature    *etree.Element
+}
+
+func (r *AuthnRequest) getDestination() string {
+	return r.Destination
+}
+
+func (r *LogoutRequest) getDestination() string {
+	return r.Destination
+}
+
+func (r *AuthnRequest) getID() string {
+	return r.ID
+}
+
+func (r *LogoutRequest) getID() string {
+	return r.ID
+}
+
 // Element returns an etree.Element representing the object
 // Element returns an etree.Element representing the object in XML form.
 func (r *AuthnRequest) Element() *etree.Element {
@@ -48,8 +89,8 @@ func (r *AuthnRequest) Element() *etree.Element {
 	el.CreateAttr("ID", r.ID)
 	el.CreateAttr("Version", r.Version)
 	el.CreateAttr("IssueInstant", r.IssueInstant.Format(timeFormat))
-	if r.Destination != "" {
-		el.CreateAttr("Destination", r.Destination)
+	if r.getDestination() != "" {
+		el.CreateAttr("Destination", r.getDestination())
 	}
 	if r.Consent != "" {
 		el.CreateAttr("Consent", r.Consent)
@@ -95,6 +136,39 @@ func (r *AuthnRequest) Element() *etree.Element {
 	}
 	if r.ProviderName != "" {
 		el.CreateAttr("ProviderName", r.ProviderName)
+	}
+	return el
+}
+
+// Element returns an etree.Element representing the object
+// Element returns an etree.Element representing the object in XML form.
+func (r *LogoutRequest) Element() *etree.Element {
+	el := etree.NewElement("samlp:LogoutRequest")
+	el.CreateAttr("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion")
+	el.CreateAttr("xmlns:samlp", "urn:oasis:names:tc:SAML:2.0:protocol")
+	el.CreateAttr("ID", r.ID)
+	el.CreateAttr("Version", r.Version)
+	el.CreateAttr("IssueInstant", r.IssueInstant.Format(timeFormat))
+	if r.Reason != "" {
+		el.CreateAttr("Reason", r.Reason)
+	}
+	if r.Destination != "" {
+		el.CreateAttr("Destination", r.Destination)
+	}
+	if r.NameID != nil {
+		el.AddChild(r.NameID.Element())
+	}
+	if r.SessionIndex != nil {
+		el.AddChild(r.SessionIndex.Element())
+	}
+	if r.Issuer != nil {
+		el.AddChild(r.Issuer.Element())
+	}
+	if r.ProtocolBinding != "" {
+		el.CreateAttr("ProtocolBinding", r.ProtocolBinding)
+	}
+	if r.Signature != nil {
+		el.AddChild(r.Signature)
 	}
 	return el
 }
@@ -189,6 +263,28 @@ func (a *NameIDPolicy) Element() *etree.Element {
 // See http://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
 type Response struct {
 	XMLName      xml.Name  `xml:"urn:oasis:names:tc:SAML:2.0:protocol Response"`
+	ID           string    `xml:",attr"`
+	InResponseTo string    `xml:",attr"`
+	Version      string    `xml:",attr"`
+	IssueInstant time.Time `xml:",attr"`
+	Destination  string    `xml:",attr"`
+	Consent      string    `xml:",attr"`
+	Issuer       *Issuer   `xml:"urn:oasis:names:tc:SAML:2.0:assertion Issuer"`
+	Signature    *etree.Element
+	Status       Status `xml:"urn:oasis:names:tc:SAML:2.0:protocol Status"`
+
+	// TODO(ross): more than one EncryptedAssertion is allowed
+	EncryptedAssertion *etree.Element `xml:"urn:oasis:names:tc:SAML:2.0:assertion EncryptedAssertion"`
+
+	// TODO(ross): more than one Assertion is allowed
+	Assertion *Assertion `xml:"urn:oasis:names:tc:SAML:2.0:assertion Assertion"`
+}
+
+// LogoutResponse represents the SAML object of the same name.
+//
+// See http://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
+type LogoutResponse struct {
+	XMLName      xml.Name  `xml:"urn:oasis:names:tc:SAML:2.0:protocol LogoutResponse"`
 	ID           string    `xml:",attr"`
 	InResponseTo string    `xml:",attr"`
 	Version      string    `xml:",attr"`
@@ -543,6 +639,22 @@ func (a *NameID) Element() *etree.Element {
 	if a.SPProvidedID != "" {
 		el.CreateAttr("SPProvidedID", a.SPProvidedID)
 	}
+	if a.Value != "" {
+		el.SetText(a.Value)
+	}
+	return el
+}
+
+// SessionIndex represents the SAML element SessionIndex for LogoutRequest.
+//
+// See http://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf §3.7.1
+type SessionIndex struct {
+	Value string `xml:",chardata"`
+}
+
+// Element returns an etree.Element representing the object in XML form.
+func (a *SessionIndex) Element() *etree.Element {
+	el := etree.NewElement("saml:SessionIndex")
 	if a.Value != "" {
 		el.SetText(a.Value)
 	}

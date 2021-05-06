@@ -101,6 +101,24 @@ func (test *ServiceProviderTest) TestCanSetAuthenticationNameIDFormat(c *C) {
 	c.Assert(*req.NameIDPolicy.Format, Equals, string(EmailAddressNameIDFormat))
 }
 
+func (test *ServiceProviderTest) TestCanSetNameIDMakeLogoutRequest(c *C) {
+	s := ServiceProvider{
+		Key:         test.Key,
+		Certificate: test.Certificate,
+		MetadataURL: mustParseURL("https://15661444.ngrok.io/saml2/metadata"),
+		AcsURL:      mustParseURL("https://15661444.ngrok.io/saml2/acs"),
+		LogoutURL:   mustParseURL("https://example.com/saml2/logout"),
+	}
+
+	var idpURL, userID, sessionIndex string
+	idpURL = ""
+	userID = "userid@invisionapp.com"
+	sessionIndex = "test-121"
+	req, err := s.MakeLogoutRequest(idpURL, userID, sessionIndex)
+	c.Assert(err, IsNil)
+	c.Assert(req.NameID.Value, Equals, userID)
+}
+
 func (test *ServiceProviderTest) TestCanProduceMetadata(c *C) {
 	s := ServiceProvider{
 		Key:         test.Key,
@@ -108,6 +126,7 @@ func (test *ServiceProviderTest) TestCanProduceMetadata(c *C) {
 		MetadataURL: mustParseURL("https://example.com/saml2/metadata"),
 		AcsURL:      mustParseURL("https://example.com/saml2/acs"),
 		IDPMetadata: &EntityDescriptor{},
+		LogoutURL:   mustParseURL("https://example.com/saml2/logout"),
 	}
 	err := xml.Unmarshal([]byte(test.IDPMetadata), &s.IDPMetadata)
 	c.Assert(err, IsNil)
@@ -135,6 +154,8 @@ func (test *ServiceProviderTest) TestCanProduceMetadata(c *C) {
 		"      <EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes256-cbc\"></EncryptionMethod>\n"+
 		"      <EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\"></EncryptionMethod>\n"+
 		"    </KeyDescriptor>\n"+
+		"    <SingleLogoutService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\" Location=\"https://example.com/saml2/logout\"></SingleLogoutService>\n"+
+		"    <SingleLogoutService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\" Location=\"https://example.com/saml2/logout\"></SingleLogoutService>\n"+
 		"    <AssertionConsumerService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\" Location=\"https://example.com/saml2/acs\" index=\"1\"></AssertionConsumerService>\n"+
 		"  </SPSSODescriptor>\n"+
 		"</EntityDescriptor>")
@@ -181,7 +202,7 @@ func (test *ServiceProviderTest) TestCanProducePostRequest(c *C) {
 	err := xml.Unmarshal([]byte(test.IDPMetadata), &s.IDPMetadata)
 	c.Assert(err, IsNil)
 
-	form, err := s.MakePostAuthenticationRequest("relayState")
+	form, reqID, err := s.MakePostAuthenticationRequest("relayState")
 	c.Assert(err, IsNil)
 
 	c.Assert(string(form), Equals, ``+

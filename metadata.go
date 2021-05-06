@@ -216,6 +216,7 @@ type SPSSODescriptor struct {
 	XMLName xml.Name `xml:"urn:oasis:names:tc:SAML:2.0:metadata SPSSODescriptor"`
 	SSODescriptor
 	AuthnRequestsSigned        *bool                       `xml:",attr"`
+	LogoutRequestsSigned       *bool                       `xml:",attr"`
 	WantAssertionsSigned       *bool                       `xml:",attr"`
 	AssertionConsumerServices  []IndexedEndpoint           `xml:"AssertionConsumerService"`
 	AttributeConsumingServices []AttributeConsumingService `xml:"AttributeConsumingService"`

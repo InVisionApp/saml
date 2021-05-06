@@ -3,7 +3,10 @@ package saml
 import (
 	"bytes"
 	"compress/flate"
+	"crypto"
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/xml"
@@ -76,6 +79,10 @@ type ServiceProvider struct {
 	// attribute in the metadata endpoint
 	MetadataValidDuration time.Duration
 
+	// LogoutURL is the full URL to the logout endpoint on this host,
+	// i.e. https://example.com/saml/logout
+	LogoutURL url.URL
+
 	// Logger is used to log messages for example in the event of errors
 	Logger logger.Interface
 
@@ -108,6 +115,7 @@ func (sp *ServiceProvider) Metadata() *EntityDescriptor {
 	}
 
 	authnRequestsSigned := false
+	logoutRequestSigned := false
 	wantAssertionsSigned := true
 	return &EntityDescriptor{
 		EntityID:   sp.MetadataURL.String(),
@@ -139,10 +147,20 @@ func (sp *ServiceProvider) Metadata() *EntityDescriptor {
 							},
 						},
 					},
+					SingleLogoutServices: []Endpoint{
+						Endpoint{
+							Binding:  HTTPPostBinding,
+							Location: sp.LogoutURL.String(),
+						},
+						Endpoint{
+							Binding:  HTTPRedirectBinding,
+							Location: sp.LogoutURL.String(),
+						},
+					},
 				},
 				AuthnRequestsSigned:  &authnRequestsSigned,
+				LogoutRequestsSigned: &logoutRequestSigned,
 				WantAssertionsSigned: &wantAssertionsSigned,
-
 				AssertionConsumerServices: []IndexedEndpoint{
 					IndexedEndpoint{
 						Binding:  HTTPPostBinding,
@@ -166,8 +184,52 @@ func (sp *ServiceProvider) MakeRedirectAuthenticationRequest(relayState string) 
 	return req.Redirect(relayState), nil
 }
 
+// MakeRedirectLogoutRequest creates a SAML authentication request using
+// the HTTP-Redirect binding. It returns a URL that we will redirect the user to
+// in order to start the auth process.
+func (sp *ServiceProvider) MakeRedirectLogoutRequest(userID, sessionIndex, relayState string) (*url.URL, error) {
+	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPRedirectBinding), userID, sessionIndex)
+	if err != nil {
+		return nil, err
+	}
+	//	return req.Redirect(relayState), nil
+	return req.RedirectSigned(relayState, sp.Key), nil
+}
+
 // Redirect returns a URL suitable for using the redirect binding with the request
 func (req *AuthnRequest) Redirect(relayState string) *url.URL {
+	auth := redirect(req, relayState)
+	return auth
+}
+
+func (req *LogoutRequest) Redirect(relayState string) *url.URL {
+	return redirect(req, relayState)
+}
+
+func (req *LogoutRequest) RedirectSigned(relayState string, key *rsa.PrivateKey) *url.URL {
+	redirectURL := redirect(req, relayState)
+
+	query := redirectURL.Query()
+
+	sigAlg := "http://www.w3.org/2000/09/xmldsig#sha256"
+	query.Set("SigAlg", sigAlg)
+
+	redirectURL.RawQuery = query.Encode()
+
+	h := sha256.New()
+	h.Write([]byte(query.Encode()))
+	d := h.Sum(nil)
+	signature, _ := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, d)
+
+	query = redirectURL.Query()
+	query.Set("Signature", base64.StdEncoding.EncodeToString(signature))
+
+	redirectURL.RawQuery = query.Encode()
+
+	return redirectURL
+}
+
+func redirect(req SAMLRequest, relayState string) *url.URL {
 	w := &bytes.Buffer{}
 	w1 := base64.NewEncoder(base64.StdEncoding, w)
 	w2, _ := flate.NewWriter(w1, 9)
@@ -179,7 +241,7 @@ func (req *AuthnRequest) Redirect(relayState string) *url.URL {
 	w2.Close()
 	w1.Close()
 
-	rv, _ := url.Parse(req.Destination)
+	rv, _ := url.Parse(req.getDestination())
 
 	query := rv.Query()
 	query.Set("SAMLRequest", string(w.Bytes()))
@@ -198,6 +260,19 @@ func (sp *ServiceProvider) GetSSOBindingLocation(binding string) string {
 		for _, singleSignOnService := range idpSSODescriptor.SingleSignOnServices {
 			if singleSignOnService.Binding == binding {
 				return singleSignOnService.Location
+			}
+		}
+	}
+	return ""
+}
+
+// GetSLOBindingLocation returns URL for the IDP's Single Sign On Service binding
+// of the specified type (HTTPRedirectBinding or HTTPPostBinding)
+func (sp *ServiceProvider) GetSLOBindingLocation(binding string) string {
+	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
+		for _, singleLogoutService := range idpSSODescriptor.SingleLogoutServices {
+			if singleLogoutService.Binding == binding {
+				return singleLogoutService.Location
 			}
 		}
 	}
@@ -284,19 +359,68 @@ func (sp *ServiceProvider) MakeAuthenticationRequest(idpURL string) (*AuthnReque
 	return &req, nil
 }
 
+// MakeLogoutRequest produces a new LogoutRequest object for idpURL.
+func (sp *ServiceProvider) MakeLogoutRequest(logoutURL string, userID string, sessionIndex string) (*LogoutRequest, error) {
+	req := LogoutRequest{
+		Destination:     logoutURL,
+		ProtocolBinding: HTTPPostBinding, // default binding for the response
+		ID:              fmt.Sprintf("id-%x", randomBytes(20)),
+		IssueInstant:    TimeNow(),
+		Version:         "2.0",
+		Issuer: &Issuer{
+			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
+			Value:  sp.MetadataURL.String(),
+		},
+		NameID: &NameID{
+			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:unspecified",
+			//NameQualifier:   req.IDP.Metadata().EntityID,
+			//SPNameQualifier: req.ServiceProviderMetadata.EntityID,
+			Value: userID,
+		},
+		SessionIndex: &SessionIndex{
+			Value: sessionIndex,
+		},
+	}
+
+	return &req, nil
+}
+
 // MakePostAuthenticationRequest creates a SAML authentication request using
 // the HTTP-POST binding. It returns HTML text representing an HTML form that
 // can be sent presented to a browser to initiate the login process.
-func (sp *ServiceProvider) MakePostAuthenticationRequest(relayState string) ([]byte, error) {
+func (sp *ServiceProvider) MakePostAuthenticationRequest(relayState string) ([]byte, string, error) {
 	req, err := sp.MakeAuthenticationRequest(sp.GetSSOBindingLocation(HTTPPostBinding))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return req.Post(relayState), nil
+
+	form, reqID := req.Post(relayState)
+	return form, reqID, nil
+}
+
+// MakePostLogoutRequest creates a SAML authentication request using
+// the HTTP-POST binding. It returns HTML text representing an HTML form that
+// can be sent presented to a browser to initiate the login process.
+func (sp *ServiceProvider) MakePostLogoutRequest(userID, sessionIndex, relayState string) ([]byte, string, error) {
+	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPPostBinding), userID, sessionIndex)
+	if err != nil {
+		return nil, "", err
+	}
+
+	form, reqID := req.Post(relayState)
+	return form, reqID, nil
 }
 
 // Post returns an HTML form suitable for using the HTTP-POST binding with the request
-func (req *AuthnRequest) Post(relayState string) []byte {
+func (req *AuthnRequest) Post(relayState string) (form []byte, requestID string) {
+	return post(req, relayState)
+}
+
+func (req *LogoutRequest) Post(relayState string) (form []byte, requestID string) {
+	return post(req, relayState)
+}
+
+func post(req SAMLRequest, relayState string) (form []byte, requestID string) {
 	doc := etree.NewDocument()
 	doc.SetRoot(req.Element())
 	reqBuf, err := doc.WriteToBytes()
@@ -305,30 +429,31 @@ func (req *AuthnRequest) Post(relayState string) []byte {
 	}
 	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 
-	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
+	tmpl := template.Must(template.New("saml-post-form.html").Parse(`` +
+		`<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>` +
 		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
 		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
 		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
-		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
+		`<input id="SAMLSubmitButton" type="submit" value="continue" />` +
 		`</form>` +
 		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";</script>` +
-		`<script>document.getElementById('SAMLRequestForm').submit();</script>`))
+		`<script>document.getElementById('SAMLRequestForm').submit();</script>` +
+		`</<body></html>`))
 	data := struct {
 		URL         string
 		SAMLRequest string
 		RelayState  string
 	}{
-		URL:         req.Destination,
+		URL:         req.getDestination(),
 		SAMLRequest: encodedReqBuf,
 		RelayState:  relayState,
 	}
 
 	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
+	if err := tmpl.ExecuteTemplate(&rv, "saml-post-form.html", data); err != nil {
 		panic(err)
 	}
-
-	return rv.Bytes()
+	return rv.Bytes(), req.getID()
 }
 
 // AssertionAttributes is a list of AssertionAttribute
@@ -469,6 +594,132 @@ func (sp *ServiceProvider) ParseResponse(req *http.Request, possibleRequestIDs [
 		// TODO(ross): verify that the namespace is urn:oasis:names:tc:SAML:2.0:protocol
 		responseEl := doc.Root()
 		if responseEl.Tag != "Response" {
+			retErr.PrivateErr = fmt.Errorf("expected to find a response object, not %s", doc.Root().Tag)
+			return nil, requestID, retErr
+		}
+
+		if err = sp.validateSigned(responseEl); err != nil {
+			retErr.PrivateErr = err
+			return nil, requestID, retErr
+		}
+
+		assertion = resp.Assertion
+	}
+
+	// decrypt the response
+	if resp.EncryptedAssertion != nil {
+		doc := etree.NewDocument()
+		if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+			retErr.PrivateErr = err
+			return nil, requestID, retErr
+		}
+		el := doc.FindElement("//EncryptedAssertion/EncryptedData")
+		plaintextAssertion, err := xmlenc.Decrypt(sp.Key, el)
+		if err != nil {
+			retErr.PrivateErr = fmt.Errorf("failed to decrypt response: %s", err)
+			return nil, requestID, retErr
+		}
+		retErr.Response = string(plaintextAssertion)
+
+		doc = etree.NewDocument()
+		if err := doc.ReadFromBytes(plaintextAssertion); err != nil {
+			retErr.PrivateErr = fmt.Errorf("cannot parse plaintext response %v", err)
+			return nil, requestID, retErr
+		}
+
+		if err := sp.validateSigned(doc.Root()); err != nil {
+			retErr.PrivateErr = err
+			return nil, requestID, retErr
+		}
+
+		assertion = &Assertion{}
+		if err := xml.Unmarshal(plaintextAssertion, assertion); err != nil {
+			retErr.PrivateErr = err
+			return nil, requestID, retErr
+		}
+	}
+
+	if err := sp.validateAssertion(assertion, possibleRequestIDs, now, skipEntity); err != nil {
+		retErr.PrivateErr = fmt.Errorf("assertion invalid: %s", err)
+		return nil, requestID, retErr
+	}
+
+	return assertion, requestID, nil
+}
+
+// ParseLogoutResponse extracts the SAML IDP response received in logoutReq, validates
+// it, and returns the verified attributes of the request.
+//
+// This function handles decrypting the message, verifying the digital
+// signature on the assertion, and verifying that the specified conditions
+// and properties are met.
+//
+// If the function fails it will return an InvalidResponseError whose
+// properties are useful in describing which part of the parsing process
+// failed. However, to discourage inadvertent disclosure the diagnostic
+// information, the Error() method returns a static string.
+func (sp *ServiceProvider) ParseLogoutResponse(req *http.Request, possibleRequestIDs []string, skipEntity bool) (*Assertion, string, error) {
+	now := TimeNow()
+	requestID := ""
+	retErr := &InvalidResponseError{
+		Now:      now,
+		Response: req.PostForm.Get("SAMLResponse"),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(req.PostForm.Get("SAMLResponse"))
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("cannot parse base64: %s", err)
+		return nil, requestID, retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	// do some validation first before we decrypt
+	resp := LogoutResponse{}
+	if err := xml.Unmarshal(rawResponseBuf, &resp); err != nil {
+		retErr.PrivateErr = fmt.Errorf("cannot unmarshal response: %s", err)
+		return nil, requestID, retErr
+	}
+	if resp.Destination != sp.LogoutURL.String() {
+		retErr.PrivateErr = fmt.Errorf("`Destination` does not match AcsURL (expected %q)", sp.AcsURL.String())
+		return nil, requestID, retErr
+	}
+
+	requestIDvalid := false
+	for _, possibleRequestID := range possibleRequestIDs {
+		if resp.InResponseTo == possibleRequestID {
+			requestIDvalid = true
+			requestID = possibleRequestID
+		}
+	}
+	if !requestIDvalid {
+		retErr.PrivateErr = fmt.Errorf("`InResponseTo` does not match any of the possible request IDs (expected %v)", possibleRequestIDs)
+		return nil, requestID, retErr
+	}
+
+	if resp.IssueInstant.Add(MaxIssueDelay).Before(now) {
+		retErr.PrivateErr = fmt.Errorf("IssueInstant expired at %s", resp.IssueInstant.Add(MaxIssueDelay))
+		return nil, requestID, retErr
+	}
+	if !skipEntity && (resp.Issuer.Value != sp.IDPMetadata.EntityID) {
+		retErr.PrivateErr = fmt.Errorf("Issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
+		return nil, requestID, retErr
+	}
+	if resp.Status.StatusCode.Value != StatusSuccess {
+		retErr.PrivateErr = fmt.Errorf("Status code was not %s", StatusSuccess)
+		return nil, requestID, retErr
+	}
+
+	var assertion *Assertion
+	if resp.EncryptedAssertion == nil {
+
+		doc := etree.NewDocument()
+		if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+			retErr.PrivateErr = err
+			return nil, requestID, retErr
+		}
+
+		responseEl := doc.Root()
+		if responseEl.Tag != "LogoutResponse" {
 			retErr.PrivateErr = fmt.Errorf("expected to find a response object, not %s", doc.Root().Tag)
 			return nil, requestID, retErr
 		}
